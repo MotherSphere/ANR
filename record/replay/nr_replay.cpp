@@ -110,6 +110,78 @@ bool Parse(int argc, char** argv, Options& o, std::string& error) {
     return true;
 }
 
+// A color texture's texels as RGB values in [0, 1] (FP16 clipped), every `step`-th texel; empty for other layouts.
+std::vector<float> Rgb(const record::Texture& t, const std::vector<uint8_t>& texels, size_t step) {
+    std::vector<float> out;
+    const size_t n = (size_t)t.width * t.height;
+    if (texels.size() != n * t.texel)
+        return out;
+    for (size_t i = 0; i < n; i += step) {
+        const uint8_t* p = texels.data() + i * t.texel;
+        if (t.upload == record::vk::R8G8B8A8_UNORM || t.upload == record::vk::R8G8B8A8_SRGB) {
+            for (int c = 0; c < 3; c++)
+                out.push_back(p[c] / 255.0f);
+        } else if (t.upload == record::vk::A2B10G10R10_UNORM_PACK32) {
+            uint32_t w;
+            std::memcpy(&w, p, 4);
+            for (int c = 0; c < 3; c++)
+                out.push_back(((w >> (10 * c)) & 0x3FF) / 1023.0f);
+        } else if (t.upload == record::vk::R16G16B16A16_SFLOAT) {
+            for (int c = 0; c < 3; c++) {
+                uint16_t h;
+                std::memcpy(&h, p + 2 * c, 2);
+                out.push_back(std::clamp(replay::FromHalf(h), 0.0f, 1.0f));
+            }
+        } else {
+            return {};
+        }
+    }
+    return out;
+}
+
+double Mse(const std::vector<float>& a, const std::vector<float>& b) {
+    double sum = 0;
+    for (size_t i = 0; i < a.size(); i++)
+        sum += (double)(a[i] - b[i]) * (a[i] - b[i]);
+    return a.empty() ? 0 : sum / (double)a.size();
+}
+
+// Whether the recording's HUD-less color is a real frame late: some games' DLSS-G hosts copy it into the texture
+// they pass after the call that passes it (the recording holds what the call's texture held). Over up to 12 real
+// frames that move, it counts those whose HUD-less color is closer to the previous backbuffer than to their own.
+struct HudlessCheck {
+    bool checked = false, late = false;
+    int moving = 0, late_votes = 0;
+};
+
+HudlessCheck CheckHudless(record::Recording& rec, size_t first, size_t last, record::Pool& pool) {
+    HudlessCheck out;
+    const record::Texture* hud = rec.Find("hudless");
+    const record::Texture* bb = rec.Find("backbuffer");
+    if (!hud || !bb || hud->upload != bb->upload || hud->width != bb->width || hud->height != bb->height)
+        return out;
+    record::DecodeScratch scratch;
+    std::vector<float> previous;
+    const size_t step = 7;  // a sample of the texels is enough
+    for (size_t k = first; k < last && k < first + 13 && out.moving < 12; k++) {
+        std::map<std::string, std::vector<uint8_t>> textures;
+        std::string error;
+        if (!record::Decode(rec, rec.index[k], pool, scratch, textures, error))
+            return out;
+        std::vector<float> b = Rgb(*bb, textures["backbuffer"], step), h = Rgb(*hud, textures["hudless"], step);
+        if (b.empty() || h.empty())
+            return out;
+        out.checked = true;
+        if (!previous.empty() && !rec.index[k].dropped && Mse(b, previous) > 1e-5) {
+            out.moving++;
+            out.late_votes += Mse(h, previous) < Mse(h, b);
+        }
+        previous = std::move(b);
+    }
+    out.late = out.moving >= 3 && 3 * out.late_votes >= 2 * out.moving;
+    return out;
+}
+
 struct Decoded {
     size_t k = 0;
     std::map<std::string, std::vector<uint8_t>> textures;
@@ -161,7 +233,7 @@ int Run(const Options& o, nlohmann::json& report, std::string& error) {
         return 1;
     }
     const size_t first = (size_t)std::clamp<int64_t>(o.first, 0, (int64_t)rec.index.size());
-    const size_t last = o.last < 0 ? rec.index.size() : (size_t)std::clamp<int64_t>(o.last, (int64_t)first,
+    size_t last = o.last < 0 ? rec.index.size() : (size_t)std::clamp<int64_t>(o.last, (int64_t)first,
                                                                                       (int64_t)rec.index.size());
     if (first >= last) {
         error = "--frames selects no recorded frame (the recording has " + std::to_string(rec.index.size()) + ")";
@@ -385,6 +457,19 @@ int Run(const Options& o, nlohmann::json& report, std::string& error) {
               {"real_frames", {first, last}},
               {"raw", o.raw},
               {"stream", o.stream.empty() ? nlohmann::json() : nlohmann::json(o.stream)}};
+    // A late HUD-less color would give the generators each pair's colors a real frame behind its depth, motion and
+    // backbuffer; ANR FG generates from the HUD-less color, so its frames would land one real interval late. Each real
+    // frame then gets the next recorded frame's HUD-less color, and the last frame of the recording is not replayed.
+    record::Pool pool_for_check(std::max(2u, std::thread::hardware_concurrency()));
+    const HudlessCheck hudless = CheckHudless(rec, first, last, pool_for_check);
+    if (hudless.late && last == rec.index.size())
+        last--;
+    report["hudless"] = {{"checked", hudless.checked}, {"moving_frames", hudless.moving},
+                         {"late_votes", hudless.late_votes},
+                         {"late", hudless.late},
+                         {"replayed", hudless.late ? "each real frame with the next recorded frame's HUD-less color"
+                                                   : "as recorded"}};
+    report["real_frames"] = {first, last};
     if (!ignored.empty())
         report["ignored_textures"] = ignored;
     if (report["recording"].get<std::string>().empty())
@@ -406,12 +491,20 @@ int Run(const Options& o, nlohmann::json& report, std::string& error) {
     record::Pool pool(std::max(2u, std::thread::hardware_concurrency()));
     std::thread decoder([&] {
         record::DecodeScratch scratch;
-        for (size_t k = first; k < last && !stop; k++) {
+        std::unique_ptr<Decoded> held;  // with a late HUD-less color: the frame waiting for the next one's
+        for (size_t k = first; k < last + (hudless.late ? 1 : 0) && !stop; k++) {
             auto d = std::make_unique<Decoded>();
             d->k = k;
             if (!record::Decode(rec, rec.index[k], pool, scratch, d->textures, d->error) && d->error.empty())
                 d->error = "decode failed";
             const bool bad = !d->error.empty();
+            if (hudless.late && !bad) {
+                if (held && !rec.index[k].dropped)
+                    held->textures["hudless"] = d->textures["hudless"];
+                std::swap(held, d);
+                if (!d)
+                    continue;
+            }
             if (!decoded.Push(std::move(d)) || bad)
                 break;
         }

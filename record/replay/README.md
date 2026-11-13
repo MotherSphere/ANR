@@ -116,6 +116,7 @@ Raw frames are for short runs: a 3840 x 2160 frame takes 66 MB. For videos of lo
 | `gpu_ms_median` | The median GPU time of one real frame's calls (D3D12 timestamps around them) |
 | `seconds` | The replay's wall time |
 | `ignored_textures` | Recorded roles that are not DLSS-G inputs, where any |
+| `hudless` | Whether the recording's HUD-less color is a real frame late (closer to the previous backbuffer than to its own in at least 2 of 3 of up to 12 moving frames): `checked`, `moving_frames`, `late_votes`, `late`, `replayed`. When late, each real frame gets the next recorded frame's HUD-less color and the recording's last frame is not replayed, so that generators that interpolate the HUD-less color (ANR FG) do not run a real frame behind |
 | `status` | `complete` or `failed: <why>` |
 
 A frame:

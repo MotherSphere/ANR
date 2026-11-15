@@ -55,7 +55,7 @@ Requirements:
 - [ffmpeg](https://ffmpeg.org/download.html) and ffprobe on the `PATH`;
 - for DLSS-G replays, an NVIDIA RTX 40 or 50 series GPU.
 
-1. **Install.** Download `nr-record-1.1-windows.zip` or `nr-record-1.1-linux.tar.gz` from the [FG-V.B15 release](../../releases/tag/FG-V.B15) and extract it. Close the game and run the installer with the folder of the game's `.exe`:
+1. **Install.** Download `nr-record-1.2-windows.zip` or `nr-record-1.2-linux.tar.gz` from the [FG-V.B18 release](../../releases/tag/FG-V.B18) and extract it. Close the game and run the installer with the folder of the game's `.exe`:
    - Windows: `install.cmd "<folder>"`. No launch option is needed.
    - Linux and Steam Deck (Proton): `sh install.sh "<folder>"`. Set the game's Steam launch options to `WINEDLLOVERRIDES="dxgi=n,b" %command%` (the ANR FG installer prints the same line). Do not set this on Windows: the game may not start.
 
